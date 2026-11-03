@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 pub use crate::protocols::WorkerAffinityTarget as AffinityTarget;
 
 pub const MAX_SESSION_AFFINITY_TTL_SECS: u64 = 31_536_000;
-pub const MAX_SESSION_AFFINITY_ENTRIES: usize = 65_536;
+pub const MAX_SESSION_AFFINITY_ENTRIES: usize = 4_194_304;
 pub const MAX_SESSION_AFFINITY_ID_BYTES: usize = 256;
 
 /// The native binding key shared by the subagents of one parent session.
