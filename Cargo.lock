@@ -1467,7 +1467,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -2764,8 +2764,7 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers-v2"
 version = "0.7.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "561fd41706eeccdad858e90702f736a35020d7c3761c5c6e7dbb47a83bf1a59f"
+source = "git+https://github.com/vtta/frontend-crates.git?rev=5f7fbbf87bbfca7a586acbd5482d0367b442353e#5f7fbbf87bbfca7a586acbd5482d0367b442353e"
 dependencies = [
  "anyhow",
  "dynamo-structural-tag",
@@ -2782,8 +2781,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "8.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "774a621dbee86866def6f59eac858651bf080af0732e9c3c4e46081563749c9a"
+source = "git+https://github.com/vtta/frontend-crates.git?rev=5f7fbbf87bbfca7a586acbd5482d0367b442353e#5f7fbbf87bbfca7a586acbd5482d0367b442353e"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -2800,9 +2798,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "8.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "144979b6e4a9fe44556c02ea92d17413d803b704de73e1f1f8255da9ce9dd99d"
+version = "8.1.0"
+source = "git+https://github.com/vtta/frontend-crates.git?rev=5f7fbbf87bbfca7a586acbd5482d0367b442353e#5f7fbbf87bbfca7a586acbd5482d0367b442353e"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3033,8 +3030,7 @@ dependencies = [
 [[package]]
 name = "dynamo-structural-tag"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8d57353db2c855b6d8154bb67b752d95547ee33eda3ee55342c0625211bdaae"
+source = "git+https://github.com/vtta/frontend-crates.git?rev=5f7fbbf87bbfca7a586acbd5482d0367b442353e#5f7fbbf87bbfca7a586acbd5482d0367b442353e"
 dependencies = [
  "anyhow",
  "regex",
@@ -4507,7 +4503,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration 0.6.1",
  "tokio",
  "tower-service",
@@ -7340,8 +7336,8 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -7360,8 +7356,8 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -7382,7 +7378,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7395,7 +7391,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7583,7 +7579,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7621,7 +7617,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -10950,7 +10946,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

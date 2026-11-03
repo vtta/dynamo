@@ -138,3 +138,12 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 inherits = "release"
 debug = true
 strip = false
+
+# This wheel has its own workspace; keep source overrides aligned with the root.
+[patch.crates-io]
+# Keep the shared protocol types identical in direct and transitive dependencies.
+dynamo-protocols = { git = "https://github.com/vtta/frontend-crates.git", rev = "5f7fbbf87bbfca7a586acbd5482d0367b442353e" }
+
+[patch."https://github.com/vtta/frontend-crates.git"]
+# The renderer and runtime must share EncodeSegment and tokenizer traits.
+dynamo-tokenizers = { version = "=3.1.3" }
