@@ -5727,7 +5727,8 @@ mod tests {
             let mut generator = request.response_generator(REQUEST_ID.to_string());
             generator.update_isl(INPUT_TOKENS as u32);
             OpenAIPreprocessor::transform_postprocessor_stream(
-                futures::stream::iter(outputs),
+                futures::stream::iter(outputs)
+                    .map(|chunk| chunk.map_data(|output| Ok(output.into()))),
                 Box::new(generator),
                 Arc::new(TestContext),
                 capture,

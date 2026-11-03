@@ -15,6 +15,10 @@
 //! Further post-processing can happen in the response stream. One example is the jailing mechanism for partial
 //! hidden stop condition matches, which can be handled in the response stream rather than the backend.
 
+pub(crate) mod decoded;
+use decoded::DecodedPieces;
+pub use decoded::{DecodedOutput, DecodedPiece};
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -56,6 +60,34 @@ pub type ExecutionOutputStream = Annotated<LLMEngineOutput>;
 /// Context for executing LLM inference, engine consumes backend input and produces execution output stream
 pub type ExecutionContext = ServerStreamingEngine<PreprocessedRequest, ExecutionOutputStream>;
 
+#[derive(Debug)]
+struct DecodedEngineOutput {
+    output: LLMEngineOutput,
+    pieces: Option<Vec<DecodedPiece>>,
+}
+impl std::ops::Deref for DecodedEngineOutput {
+    type Target = LLMEngineOutput;
+    fn deref(&self) -> &LLMEngineOutput {
+        &self.output
+    }
+}
+impl std::ops::DerefMut for DecodedEngineOutput {
+    fn deref_mut(&mut self) -> &mut LLMEngineOutput {
+        &mut self.output
+    }
+}
+fn decoded_engine(output: ExecutionOutputStream) -> Annotated<DecodedEngineOutput> {
+    output.map_data(|output| {
+        Ok(DecodedEngineOutput {
+            output,
+            pieces: None,
+        })
+    })
+}
+fn decode_error(error: DynamoError) -> Annotated<DecodedEngineOutput> {
+    decoded_engine(Annotated::<LLMEngineOutput>::from_err(error))
+}
+
 /// Backend handles resource management and orchestrates LLM execution
 #[allow(dead_code)]
 pub struct Backend {
@@ -72,6 +104,7 @@ struct DecoderUnfoldState {
     finished_choices: HashSet<u32>,
     validate_engine_decode: bool,
     no_stop_trim: bool,
+    classify_output_tokens: bool,
     /// Set to true when all expected choices are finished locally, causing the stream to end
     finished: bool,
     /// Tokenizer used to decode top-logprob token_ids when the backend omits text
@@ -81,7 +114,7 @@ struct DecoderUnfoldState {
     /// Text flushed from a choice's decoder because the underlying engine stream ended
     /// without ever sending that choice a terminal `finish_reason`, queued here so each
     /// flushed choice can be emitted as its own synthetic final chunk.
-    pending_flush: Vec<Annotated<LLMEngineOutput>>,
+    pending_flush: Vec<Annotated<DecodedEngineOutput>>,
     /// Set once `stream` has yielded `None`, so it is never polled again -- a `Stream` is
     /// not guaranteed to be safely pollable past its first `None`.
     stream_ended: bool,
@@ -137,6 +170,7 @@ struct DecoderParams {
     skip_special_tokens: bool,
     include_stop_str_in_output: bool,
     no_stop_trim: bool,
+    output_control_tokens: Option<decoded::ControlTokens>,
     tracker: Option<Arc<RequestTracker>>,
     n: u32,
     // In-process decoder checkpoint carried from a migrated attempt's last known-good
@@ -152,6 +186,7 @@ struct DecoderParams {
 impl DecoderParams {
     fn from_request(request: &PreprocessedRequest) -> Self {
         Self {
+            output_control_tokens: request.output_control_tokens.clone(),
             prompt_token_ids: Arc::clone(&request.token_ids),
             stop_conditions: request.stop_conditions.clone(),
             // Default to true to match upstream framework behavior:
@@ -218,6 +253,7 @@ impl Backend {
             finished_choices: HashSet::new(),
             validate_engine_decode: self.validate_engine_decode,
             no_stop_trim: params.no_stop_trim,
+            classify_output_tokens: params.output_control_tokens.is_some(),
             finished: false,
             tokenizer: tokenizer.clone(),
             skip_special_tokens: params.skip_special_tokens,
@@ -232,7 +268,7 @@ impl Backend {
 impl
     Operator<
         SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<BackendOutput>>,
+        ManyOut<Annotated<DecodedOutput>>,
         SingleIn<PreprocessedRequest>,
         ManyOut<Annotated<LLMEngineOutput>>,
     > for Backend
@@ -241,7 +277,7 @@ impl
         &self,
         request: SingleIn<PreprocessedRequest>,
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    ) -> Result<ManyOut<Annotated<BackendOutput>>> {
+    ) -> Result<ManyOut<Annotated<DecodedOutput>>> {
         let decoder_params = DecoderParams::from_request(&request);
 
         let next_stream = next.generate(request).await?;
@@ -278,6 +314,7 @@ impl
 
             match output {
                 Some(output) => {
+                    let output = decoded_engine(output);
                     // move to state.process_output
                     // handle any error conditions / unwraps here
 
@@ -327,12 +364,12 @@ impl
                     // the text fast path. Text-only output cannot honor this
                     // option; don't silently return trimmed or empty content.
                     // Empty stop trailers are valid after this choice emitted IDs.
-                    if state.no_stop_trim
+                    if (state.no_stop_trim || state.classify_output_tokens)
                         && let Some(data) = &output.data
                         && data.token_ids.is_empty()
                         && (data.text.as_ref().is_some_and(|text| !text.is_empty())
                             || data.tokens.as_ref().is_some_and(|tokens| !tokens.is_empty())
-                            || (data.finish_reason == Some(FinishReason::Stop)
+                            || (state.no_stop_trim && data.finish_reason == Some(FinishReason::Stop)
                                 && state
                                     .decoders
                                     .get(&data.index.unwrap_or(0))
@@ -342,16 +379,16 @@ impl
                         state.finished = true;
                         let error = DynamoError::builder()
                             .class(ErrorClass::BackendProtocol)
-                            .message("no_stop_trim requires backend token IDs through the matched stop; the backend omitted them")
+                            .message(if state.no_stop_trim { "no_stop_trim requires backend token IDs through the matched stop; the backend omitted them" } else { "native output parsing requires original backend token IDs" })
                             .build();
-                        return Some((Annotated::from_err(error), state));
+                        return Some((decode_error(error), state));
                     }
 
                     // if we have a data field without an event, then we might need to update the data
                     if let Some(data) = &mut output.data
                         && data.text.is_some()
                         && !state.validate_engine_decode
-                        && !state.no_stop_trim
+                        && !state.no_stop_trim && !state.classify_output_tokens
                     {
                         if data.log_probs.is_some() && data.tokens.is_none() {
                             data.tokens = Some(
@@ -542,7 +579,7 @@ impl
                         && !matches!(data.finish_reason, Some(FinishReason::Error(_)))
                     {
                         data.finish_reason = finish_reason;
-                        data.stop_reason = stop_reason.or(data.stop_reason);
+                        data.stop_reason = stop_reason.or(data.stop_reason.take());
                     }
                     data.text = text;
 
@@ -567,6 +604,14 @@ impl
                     // instead of silently losing it (see `PreprocessedRequest::jail_seed`).
                     // Skipped when migration can't happen: nothing will ever read this
                     // checkpoint, so there is no reason to allocate a snapshot of it.
+                    data.pieces = match decoder.release_pieces(data.text.as_deref().unwrap_or(""), data.finish_reason.is_some()) {
+                        Ok(pieces) => pieces,
+                        Err(error) => {
+                            state.stream.context().stop_generating();
+                            state.finished = true;
+                            return Some((decode_error(DynamoError::builder().class(ErrorClass::BackendProtocol).message("decoded token boundaries are inconsistent").diagnostic(error.to_string()).build()), state));
+                        }
+                    };
                     if state.migration_possible {
                         data.jailed_text = decoder.checkpoint();
                     }
@@ -614,7 +659,14 @@ impl
                                 ..Default::default()
                             },
                         };
-                        state.pending_flush.push(Annotated::from_data(data));
+                        let pieces = match decoder.release_pieces(data.text.as_deref().unwrap_or(""), true) {
+                            Ok(pieces) => pieces,
+                            Err(error) => {
+                                state.pending_flush.push(decode_error(DynamoError::builder().class(ErrorClass::BackendProtocol).message("decoder finalization failed").diagnostic(error.to_string()).build()));
+                                continue;
+                            }
+                        };
+                        state.pending_flush.push(Annotated::from_data(DecodedEngineOutput { output: data, pieces }));
                     }
                     state.pending_flush.pop().map(|output| (output, state))
                 }
@@ -625,26 +677,33 @@ impl
         // convert stream of processed Annotated<LLMEngineOutput> to Annotated<BackendOutput>
         //let mdcsum = self.mdcsum.clone();
         let stream = processed_stream.map(move |output| {
-            output.map_data(|data| {
-                Ok(BackendOutput {
-                    token_ids: data.token_ids,
-                    tokens: data.tokens.unwrap_or_default(),
-                    text: data.text,
-                    cum_log_probs: data.cum_log_probs,
-                    log_probs: data.log_probs,
-                    top_logprobs: data.top_logprobs,
-                    finish_reason: data.finish_reason,
-                    stop_reason: data.stop_reason,
-                    //mdcsum: mdcsum.clone(),
-                    index: data.index,
-                    completion_usage: data.completion_usage,
-                    disaggregated_params: data.disaggregated_params,
-                    encoder_result: data.encoder_result,
-                    worker_trace_link: data.worker_trace_link,
-                    engine_data: data.engine_data,
-                    routing_data: data.routing_data,
-                    jailed_text: data.jailed_text,
-                })
+            output.map_data(|frame| {
+                let DecodedEngineOutput {
+                    output: data,
+                    pieces,
+                } = frame;
+                Ok(DecodedOutput::new(
+                    BackendOutput {
+                        token_ids: data.token_ids,
+                        tokens: data.tokens.unwrap_or_default(),
+                        text: data.text,
+                        cum_log_probs: data.cum_log_probs,
+                        log_probs: data.log_probs,
+                        top_logprobs: data.top_logprobs,
+                        finish_reason: data.finish_reason,
+                        stop_reason: data.stop_reason,
+                        //mdcsum: mdcsum.clone(),
+                        index: data.index,
+                        completion_usage: data.completion_usage,
+                        disaggregated_params: data.disaggregated_params,
+                        encoder_result: data.encoder_result,
+                        worker_trace_link: data.worker_trace_link,
+                        engine_data: data.engine_data,
+                        routing_data: data.routing_data,
+                        jailed_text: data.jailed_text,
+                    },
+                    pieces,
+                ))
             })
         });
 
@@ -689,6 +748,7 @@ impl
 pub struct Decoder {
     tokenizer: Option<Tokenizer>,
     decode_stream: DecodeStream,
+    decoded_pieces: Option<DecodedPieces>,
     skip_special_tokens: bool,
     // Generated token IDs accepted by `DecodeStream::step` but not emitted yet. These
     // must be replayed after migration because moving them into the engine prompt alone
@@ -859,11 +919,14 @@ impl Decoder {
     fn new_with_checkpoint(tokenizer: Tokenizer, params: &DecoderParams) -> Result<Self> {
         // Every choice starts from the same carried-over checkpoint. This only matters for
         // `n == 1` migration retries in practice; a fresh decoder starts unseeded.
-        let (jail, pending_token_ids) = params
-            .jail_seed
-            .clone()
-            .map(DecoderCheckpoint::into_parts)
-            .unwrap_or_default();
+        let mut checkpoint = params.jail_seed.clone().unwrap_or_default();
+        let decoded_pieces = params.output_control_tokens.as_ref().map(|controls| {
+            checkpoint
+                .decoded_pieces
+                .take()
+                .unwrap_or_else(|| DecodedPieces::new(controls.clone()))
+        });
+        let (jail, pending_token_ids) = checkpoint.into_parts();
         let decoder_prompt_len = params
             .prompt_token_ids
             .len()
@@ -884,7 +947,7 @@ impl Decoder {
             }
         }
 
-        Ok(Self::from_state(
+        let mut decoder = Self::from_state(
             Some(tokenizer),
             decode_stream,
             params.skip_special_tokens,
@@ -894,7 +957,9 @@ impl Decoder {
             params.tracker.clone(),
             jail,
             pending_token_ids,
-        ))
+        );
+        decoder.decoded_pieces = decoded_pieces;
+        Ok(decoder)
     }
 
     /// Builds decoder state after its incremental stream and migration state are ready.
@@ -957,6 +1022,7 @@ impl Decoder {
         Self {
             tokenizer,
             decode_stream,
+            decoded_pieces: None,
             skip_special_tokens,
             pending_token_ids,
             tracker,
@@ -974,6 +1040,20 @@ impl Decoder {
             kmp_scratch: Vec::new(),
             kmp_pi_scratch: Vec::new(),
         }
+    }
+
+    fn record_piece(&mut self, id: Option<u32>, text: Option<&str>) -> Result<()> {
+        if let Some(pieces) = &mut self.decoded_pieces {
+            pieces.record(id, text)?;
+        }
+        Ok(())
+    }
+
+    fn release_pieces(&mut self, text: &str, finished: bool) -> Result<Option<Vec<DecodedPiece>>> {
+        self.decoded_pieces
+            .as_mut()
+            .map(|pieces| pieces.release(text, finished))
+            .transpose()
     }
 
     /// Minimum amount of work to determine if a given generated/decoded sequence should be stopped
@@ -1031,6 +1111,7 @@ impl Decoder {
 
         // stop conditions to not apply until the minimum number of tokens have been generated
         if below_min_tokens {
+            self.record_piece(Some(token_id), decoded_text.as_deref())?;
             return Ok(StepResult::ok_split(selected_token, decoded_text));
         }
 
@@ -1044,6 +1125,7 @@ impl Decoder {
 
         // Stop strings are evaluated before stop-token IDs so a configured string ending
         // at a visible stop token cannot leak through the token-stop fast path.
+        self.record_piece(Some(token_id), decoded_text.as_deref())?;
         let mut decoded = self.process_decoded_text(decoded_text)?;
         decoded.token = selected_token.clone();
         if decoded.stop_trigger.is_some() {
@@ -1175,6 +1257,7 @@ impl Decoder {
     /// Finalize tokenizer bytes through the same stop-string filter as ordinary tokens.
     fn finish(&mut self) -> Result<StepResult> {
         let tail = self.decode_stream.finish()?;
+        self.record_piece(None, tail.as_deref())?;
         self.pending_token_ids.clear();
         let mut result = if self.generated_tokens <= self.min_tokens {
             StepResult::ok(tail)
@@ -1209,8 +1292,12 @@ impl Decoder {
     /// `None` when neither layer has buffered state.
     pub(crate) fn checkpoint(&self) -> Option<DecoderCheckpoint> {
         let jailed_text = self.jailed_string().unwrap_or_default();
-        (!jailed_text.is_empty() || !self.pending_token_ids.is_empty())
-            .then(|| DecoderCheckpoint::new(jailed_text, self.pending_token_ids.clone()))
+        (!jailed_text.is_empty() || !self.pending_token_ids.is_empty()).then(|| {
+            let mut checkpoint =
+                DecoderCheckpoint::new(jailed_text, self.pending_token_ids.clone());
+            checkpoint.decoded_pieces = self.decoded_pieces.clone();
+            checkpoint
+        })
     }
 
     /// Returns the length, in bytes, of the longest suffix of `self.jail` that is also a
@@ -1439,6 +1526,147 @@ mod tests {
     }
 
     impl traits::Tokenizer for CandidateDecoder {}
+
+    #[test]
+    fn retry_restores_a_partially_released_control_token() {
+        let hf: tokenizers::Tokenizer = serde_json::from_value(serde_json::json!({
+            "version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[{"id":0,"content":"</think>","special":false,"single_word":false,
+                "lstrip":false,"rstrip":false,"normalized":false}],
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{"type":"Fuse"},
+            "model":{"type":"BPE","vocab":{"</think>":0,"ok":1},"merges":[]}
+        }))
+        .unwrap();
+        let tokenizer = Tokenizer::from(Arc::new(
+            crate::tokenizers::HuggingFaceTokenizer::from_tokenizer(hf),
+        ));
+        let mut request = jailing_request(1);
+        request.token_ids = Arc::new(Vec::new());
+        request.output_options.skip_special_tokens = Some(false);
+        request.output_control_tokens = Some(Arc::new(HashMap::from([(0, "</think>".into())])));
+        request.stop_conditions = StopConditions {
+            stop: Some(vec!["nk>x".into()]),
+            ..Default::default()
+        };
+        let mut decoder =
+            Decoder::new_with_checkpoint(tokenizer.clone(), &DecoderParams::from_request(&request))
+                .unwrap();
+        let first = decoder.process_token_ids(&[0]).unwrap();
+        assert_eq!(first.text.as_deref(), Some("</thi"));
+        assert!(
+            decoder
+                .release_pieces(first.text.as_deref().unwrap(), false)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        request.jail_seed = decoder.checkpoint();
+        request.token_ids = Arc::new(vec![0]);
+        let mut resumed =
+            Decoder::new_with_checkpoint(tokenizer, &DecoderParams::from_request(&request))
+                .unwrap();
+        let next = resumed.process_token_ids(&[1]).unwrap();
+        assert_eq!(next.text.as_deref(), Some("nk>ok"));
+        assert_eq!(
+            resumed
+                .release_pieces(next.text.as_deref().unwrap(), false)
+                .unwrap()
+                .unwrap(),
+            vec![
+                DecodedPiece::ControlToken("</think>".into()),
+                DecodedPiece::Text("ok".into())
+            ]
+        );
+        assert!(resumed.checkpoint().is_none());
+    }
+
+    #[tokio::test]
+    async fn typed_output_preserves_incremental_unicode_and_logprob_labels() {
+        let hf: tokenizers::Tokenizer = serde_json::from_value(serde_json::json!({
+            "version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[{"id":4,"content":"<eos>","special":true,"single_word":false,
+                "lstrip":false,"rstrip":false,"normalized":false}],
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"}]},
+            "model":{"type":"BPE","vocab":{"<0xF0>":0,"<0x9F>":1,"<0x98>":2,"<0x80>":3,"<eos>":4},
+                "merges":[],"byte_fallback":true}
+        }))
+        .unwrap();
+        let tokenizer: Arc<dyn traits::Tokenizer> =
+            Arc::new(crate::tokenizers::HuggingFaceTokenizer::from_tokenizer(hf));
+        for (ids, finish, expected) in [
+            (vec![0, 1, 2, 3], Some(FinishReason::Length), "😀"),
+            (vec![0], Some(FinishReason::Length), "�"),
+            (vec![0], None, "�"),
+            (vec![0, 4], None, "�"),
+        ] {
+            let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer.clone()));
+            let mut request = jailing_request(1);
+            request.output_options.skip_special_tokens = Some(false);
+            request.stop_conditions = StopConditions {
+                stop_token_ids_hidden: Some(vec![4]),
+                ..Default::default()
+            };
+            request.output_control_tokens = Some(Arc::new(HashMap::new()));
+            assert!(request.clone().output_control_tokens.is_some());
+            assert!(
+                serde_json::to_value(&request)
+                    .unwrap()
+                    .get("output_control_tokens")
+                    .is_none()
+            );
+            let request = SingleIn::new(request);
+            let last = ids.len() - 1;
+            let outputs = ids
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| LLMEngineOutput {
+                    token_ids: vec![id],
+                    finish_reason: if i == last { finish.clone() } else { None },
+                    ..Default::default()
+                })
+                .collect();
+            let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+                Arc::new(SyntheticSglangStopEngine {
+                    outputs: Some(outputs),
+                });
+            let outputs: Vec<_> = Operator::generate(backend.as_ref(), request, engine)
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            let data: Vec<_> = outputs
+                .iter()
+                .map(|r| r.data.as_ref().expect("decoded output"))
+                .collect();
+            let text: String = data.iter().filter_map(|d| d.text.as_deref()).collect();
+            let pieces: Vec<_> = data
+                .iter()
+                .flat_map(|d| match d {
+                    DecodedOutput::Tokens { pieces, .. } => pieces,
+                    _ => panic!("expected token-classified output"),
+                })
+                .collect();
+            assert_eq!(text, expected);
+            assert_eq!(
+                pieces
+                    .iter()
+                    .map(|piece| match piece {
+                        DecodedPiece::Text(text) | DecodedPiece::ControlToken(text) =>
+                            text.as_str(),
+                    })
+                    .collect::<String>(),
+                expected
+            );
+            assert!(
+                data.iter()
+                    .flat_map(|d| d.tokens.iter())
+                    .any(|s| s.as_deref() == Some("�")),
+                "logprob labels retain their own representation"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn backend_finalizes_byte_fallback_at_each_terminal_boundary() {
@@ -1713,7 +1941,7 @@ mod tests {
             "test-request".to_string(),
         );
         let response = generator
-            .choice_from_postprocessor(output)
+            .choice_from_decoded(output.into())
             .expect("OpenAI response conversion succeeds");
         let content = response.inner.choices[0]
             .logprobs
@@ -1810,7 +2038,9 @@ mod tests {
             let options = DeltaGeneratorOptions::new(None, Some(is_token_id_mode), true, None);
             let mut generator =
                 DeltaGenerator::new("test-model".to_string(), options, "unicode".to_string());
-            let response = generator.choice_from_postprocessor(output.clone()).unwrap();
+            let response = generator
+                .choice_from_decoded(output.clone().into())
+                .unwrap();
             let choice = &response.inner.choices[0];
             assert_eq!(
                 choice.delta.content,
@@ -1908,7 +2138,7 @@ mod tests {
             "test-request".to_string(),
         );
         let response = generator
-            .choice_from_postprocessor(output)
+            .choice_from_decoded(output.into())
             .expect("OpenAI response conversion succeeds");
 
         assert_eq!(
@@ -2012,7 +2242,7 @@ mod tests {
                         (user_stop && !ids.is_empty()).then_some(StopReason::Int(103))
                     );
                     let mut generator = request.response_generator("raw-test".to_string());
-                    let response = generator.choice_from_postprocessor(output).unwrap();
+                    let response = generator.choice_from_decoded(output.into()).unwrap();
                     let expected = if ids.is_empty() {
                         worker_text.unwrap_or_default()
                     } else if no_stop_trim == Some(true) {

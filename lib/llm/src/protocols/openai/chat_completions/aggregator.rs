@@ -422,6 +422,12 @@ fn finalize_merged_tool_chunk(
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseInput {
+    RawModelOutput,
+    ParsedResponses,
+}
+
 impl DeltaAggregator {
     /// Creates a new, empty [`DeltaAggregator`] instance.
     pub fn new() -> Self {
@@ -451,7 +457,13 @@ impl DeltaAggregator {
         stream: impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>,
         parsing_options: ParsingOptions,
     ) -> Result<NvCreateChatCompletionResponse, DynamoError> {
-        Self::apply_with_tool_terminal_policy(stream, parsing_options, false).await
+        Self::apply_with_tool_terminal_policy(
+            stream,
+            parsing_options,
+            false,
+            ResponseInput::RawModelOutput,
+        )
+        .await
     }
 
     pub(crate) async fn apply_for_selected_unified_parser(
@@ -472,6 +484,38 @@ impl DeltaAggregator {
             stream,
             parsing_options,
             require_explicit_tool_terminal,
+            ResponseInput::RawModelOutput,
+        )
+        .await
+    }
+
+    pub(crate) async fn apply_frontend_stream(
+        stream: impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>,
+        parsing_options: ParsingOptions,
+    ) -> Result<NvCreateChatCompletionResponse, DynamoError> {
+        let selected = super::unified_parser::selected_request_family(
+            parsing_options.tool_call_parser.as_deref(),
+            parsing_options.reasoning_parser.as_deref(),
+            parsing_options.tool_choice.as_ref(),
+            &parsing_options.guided_tool_constraint,
+        );
+        let input = if selected.is_some_and(|family| {
+            super::unified_parser::uses_decoded_input(
+                family,
+                &parsing_options.guided_tool_constraint,
+            )
+        }) {
+            ResponseInput::ParsedResponses
+        } else {
+            ResponseInput::RawModelOutput
+        };
+        let require_explicit_tool_terminal =
+            selected.is_some() && super::unified_parser::parsers_v2_selected();
+        Self::apply_with_tool_terminal_policy(
+            stream,
+            parsing_options,
+            require_explicit_tool_terminal,
+            input,
         )
         .await
     }
@@ -480,6 +524,7 @@ impl DeltaAggregator {
         stream: impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>,
         parsing_options: ParsingOptions,
         require_explicit_tool_terminal: bool,
+        input: ResponseInput,
     ) -> Result<NvCreateChatCompletionResponse, DynamoError> {
         let mut aggregator = stream
             .map(Annotated::into_data)
@@ -679,7 +724,9 @@ impl DeltaAggregator {
                     .build()
             })?;
         }
-        if let Some(family) = selected_unified_family {
+        if let Some(family) =
+            selected_unified_family.filter(|_| input == ResponseInput::RawModelOutput)
+        {
             for choice in aggregator.choices.values_mut() {
                 if choice.text.is_empty()
                     || choice
@@ -989,6 +1036,16 @@ pub trait ChatCompletionAggregator {
         stream: DataStream<Result<Message, SseCodecError>>,
         parsing_options: ParsingOptions,
     ) -> Result<NvCreateChatCompletionResponse, DynamoError>;
+}
+
+impl NvCreateChatCompletionResponse {
+    /// Fold the frontend pipeline's responses; native token parsing has already run.
+    pub(crate) async fn from_frontend_stream(
+        stream: impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>,
+        parsing_options: ParsingOptions,
+    ) -> Result<NvCreateChatCompletionResponse, DynamoError> {
+        DeltaAggregator::apply_frontend_stream(stream, parsing_options).await
+    }
 }
 
 impl ChatCompletionAggregator for NvCreateChatCompletionResponse {
@@ -2392,6 +2449,7 @@ mod tests {
             Box::pin(stream::iter(vec![annotated_delta])),
             ParsingOptions::new(Some("deepseek_v41".into()), Some("deepseek_v41".into())),
             true,
+            ResponseInput::RawModelOutput,
         )
         .await
         .expect("aggregation should succeed");
@@ -2454,6 +2512,7 @@ mod tests {
                 Some("deepseek_v41".to_string()),
             ),
             true,
+            ResponseInput::RawModelOutput,
         )
         .await
         .expect("aggregation should succeed");
@@ -2625,6 +2684,7 @@ mod tests {
                 Box::pin(stream::iter(chunks)),
                 ParsingOptions::new(Some("deepseek_v41".into()), Some("deepseek_v41".into())),
                 true,
+                ResponseInput::RawModelOutput,
             )
             .await
             .unwrap();
@@ -2655,6 +2715,7 @@ mod tests {
                 )])),
                 ParsingOptions::new(Some("deepseek_v41".into()), Some("deepseek_v41".into())),
                 true,
+                ResponseInput::RawModelOutput,
             )
             .await
             .unwrap();
@@ -2735,6 +2796,7 @@ mod tests {
             Box::pin(stream::iter(chunks)),
             ParsingOptions::new(Some("deepseek_v41".into()), Some("deepseek_v41".into())),
             true,
+            ResponseInput::RawModelOutput,
         )
         .await
         .unwrap();
@@ -2840,6 +2902,7 @@ mod tests {
                 stream::iter(vec![first.clone(), first_args.clone(), second.clone()]),
                 options,
                 unified,
+                ResponseInput::RawModelOutput,
             )
             .await
             .unwrap();
@@ -3745,6 +3808,7 @@ mod tests {
                 stream::iter([input]),
                 ParsingOptions::default(),
                 true,
+                ResponseInput::RawModelOutput,
             )
             .await
             .unwrap();
@@ -3790,6 +3854,7 @@ mod tests {
                     stream::iter([input]),
                     ParsingOptions::default(),
                     true,
+                    ResponseInput::RawModelOutput,
                 )
                 .await
                 .unwrap();

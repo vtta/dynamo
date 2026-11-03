@@ -68,6 +68,7 @@ use crate::protocols::common::extensions::{
 use crate::protocols::common::input_trigger::{
     classify_chat_request, classify_completion_request, classify_response_request,
 };
+#[cfg(test)]
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::{
     ParsingOptions,
@@ -3867,7 +3868,7 @@ async fn chat_completions(
             })?;
 
         let response =
-            NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
+            NvCreateChatCompletionResponse::from_frontend_stream(stream, parsing_options.clone())
                 .await
                 .map_err(|e| {
                     let err_response = non_streaming_aggregation_error_response(
@@ -4522,7 +4523,7 @@ async fn responses(
             })?;
 
         let response =
-            NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
+            NvCreateChatCompletionResponse::from_frontend_stream(stream, parsing_options.clone())
                 .await
                 .map_err(|e| {
                     let err_response = non_streaming_aggregation_error_response(

@@ -69,6 +69,10 @@ pub(crate) const QWEN3_UNIFIED_FAMILY: &str = "qwen3";
 pub(crate) const KIMI_K2_UNIFIED_FAMILY: &str = "kimi_k2";
 pub(crate) const KIMI_K3_UNIFIED_FAMILY: &str = "kimi_k3";
 pub(crate) const DEEPSEEK_V41_UNIFIED_FAMILY: &str = "deepseek_v41";
+pub(crate) fn uses_decoded_input(family: &str, constraint: &GuidedToolConstraint) -> bool {
+    family == DEEPSEEK_V41_UNIFIED_FAMILY && !constraint.installs_guided_json()
+}
+
 pub(crate) const DEEPSEEK_V4_UNIFIED_FAMILY: &str = "deepseek_v4";
 pub(crate) const GEMMA4_UNIFIED_FAMILY: &str = "gemma4";
 pub(crate) const GLM47_UNIFIED_FAMILY: &str = "glm47";
@@ -1579,8 +1583,35 @@ impl ChoiceState {
         tool_output_mode: UnifiedToolOutputMode,
         guided_streaming: bool,
     ) -> anyhow::Result<Self> {
-        let prefill = prefill.into();
-        let mut parser = create_unified_parser_for_family(family, tools)?;
+        Self::with_parser(
+            family,
+            create_unified_parser_for_family(family, tools)?,
+            prefill.into(),
+            tool_output_mode,
+            guided_streaming,
+        )
+    }
+
+    pub(super) fn new_token_input(
+        tools: &[Tool],
+        prefill: UnifiedParserStartingState,
+    ) -> anyhow::Result<Self> {
+        Self::with_parser(
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+            dynamo_parsers_v2::unified::deepseek_v41::token_unified(tools),
+            prefill.into(),
+            UnifiedToolOutputMode::Native,
+            false,
+        )
+    }
+
+    fn with_parser(
+        family: &str,
+        mut parser: Box<dyn UnifiedParser>,
+        prefill: StreamPrefill,
+        tool_output_mode: UnifiedToolOutputMode,
+        guided_streaming: bool,
+    ) -> anyhow::Result<Self> {
         // Harmony needs the consumed assistant header to recognize a generated
         // `to=` recipient. Other families infer their state from the rendered text.
         //
@@ -1645,6 +1676,25 @@ impl ChoiceState {
             tool_emitted: false,
             failed: false,
         })
+    }
+
+    pub(super) fn parse_decoded<'a>(
+        &mut self,
+        inputs: impl IntoIterator<Item = dynamo_parsers_v2::DecodedInput<'a>>,
+        finished: bool,
+    ) -> anyhow::Result<Vec<UnifiedParserEvent>> {
+        let mut output = UnifiedParserOutput::default();
+        for input in inputs {
+            self.parser.parse_decoded_into(input, &mut output)?;
+        }
+        if finished {
+            output.events.extend(self.parser.finish()?.events);
+        }
+        Ok(output.events)
+    }
+
+    pub(super) fn call_complete(&self, tool_index: usize) -> Option<bool> {
+        self.parser_call_completion.get(&tool_index).copied()
     }
 
     #[cfg(test)]

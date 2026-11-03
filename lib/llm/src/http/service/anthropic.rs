@@ -56,7 +56,7 @@ use crate::protocols::common::extensions::{
 use crate::protocols::common::input_trigger::classify_anthropic_request;
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
-    NvCreateChatCompletionStreamResponse, aggregator::ChatCompletionAggregator,
+    NvCreateChatCompletionStreamResponse,
 };
 use crate::protocols::unified::UnifiedRequest;
 use crate::request_template::{RequestTemplate, resolve_request_model};
@@ -929,7 +929,7 @@ async fn anthropic_messages(
             parsing_options.clone()
         };
         let chat_response =
-            NvCreateChatCompletionResponse::from_annotated_stream(stream, aggregation_options)
+            NvCreateChatCompletionResponse::from_frontend_stream(stream, aggregation_options)
                 .await
                 .map_err(|error| {
                     let error_type = if super::metrics::request_was_cancelled(&error) {

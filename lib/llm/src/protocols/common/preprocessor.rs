@@ -366,6 +366,11 @@ pub type MultimodalUuidMap = std::collections::HashMap<String, Vec<Option<String
 /// crate is responsible for converting request from the public APIs to this internal representation.
 #[derive(Serialize, Deserialize, Clone, Builder)]
 pub struct PreprocessedRequest {
+    /// Model control vocabulary for frontend decoding; retained by in-process retries.
+    #[builder(default)]
+    #[serde(skip)]
+    pub(crate) output_control_tokens: Option<crate::backend::decoded::ControlTokens>,
+
     /// ID of the model to use.
     ///
     /// `serde(default)` so canary payloads from the runtime's

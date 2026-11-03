@@ -22,7 +22,7 @@ use crate::{
     model_card::ModelDeploymentCard,
     namespace::NamespaceFilter,
     preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc},
-    protocols::common::llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest},
+    protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest},
     request_template::RequestTemplate,
     session_affinity::{AffinityCoordinator, SessionAffinityMode, create_affinity_coordinator},
     types::{
@@ -447,7 +447,7 @@ where
             Context<Req>,
             Pin<Box<dyn AsyncEngineStream<Annotated<Resp>>>>,
             Context<PreprocessedRequest>,
-            Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
+            Pin<Box<dyn AsyncEngineStream<Annotated<crate::backend::DecodedOutput>>>>,
         >,
 {
     let frontend = ServiceFrontend::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
@@ -485,14 +485,14 @@ impl PreprocessedRouting {
                 Context<Req>,
                 Pin<Box<dyn AsyncEngineStream<Annotated<Resp>>>>,
                 Context<PreprocessedRequest>,
-                Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
+                Pin<Box<dyn AsyncEngineStream<Annotated<crate::backend::DecodedOutput>>>>,
             >,
     {
         let frontend = SegmentSource::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
         let preprocessor_op = preprocessor.into_operator();
         let token_backend = Backend::from_tokenizer(tokenizer).into_operator();
         let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<BackendOutput>();
+            .into_operator_for::<crate::backend::DecodedOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());

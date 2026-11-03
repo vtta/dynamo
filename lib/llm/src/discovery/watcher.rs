@@ -1552,13 +1552,17 @@ mod tests {
         }
 
         #[async_trait]
-        impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
-            for CompletingBackend
+        impl
+            AsyncEngine<
+                SingleIn<PreprocessedRequest>,
+                ManyOut<Annotated<crate::backend::DecodedOutput>>,
+                Error,
+            > for CompletingBackend
         {
             async fn generate(
                 &self,
                 request: SingleIn<PreprocessedRequest>,
-            ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+            ) -> Result<ManyOut<Annotated<crate::backend::DecodedOutput>>, Error> {
                 let call = self.calls.fetch_add(1, Ordering::SeqCst);
                 let (_, context) = request.transfer(());
                 if call > 0 {
@@ -1579,7 +1583,8 @@ mod tests {
                             "finish_reason": "stop",
                             "index": 0
                         }))
-                        .unwrap(),
+                        .unwrap()
+                        .into(),
                     )
                 });
                 Ok(ResponseStream::new(Box::pin(stream), context.context()))

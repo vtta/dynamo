@@ -29,7 +29,7 @@ use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, AsyncEngineContext
 use dynamo_runtime::pipeline::{Context as PipelineContext, Error, ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
 
-use crate::protocols::common::llm_backend::{BackendOutput, PreprocessedRequest};
+use crate::protocols::common::llm_backend::PreprocessedRequest;
 use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
@@ -151,7 +151,11 @@ pub(super) fn maybe_wrap_stream(
     request: &NvCreateChatCompletionRequest,
     request_id: &str,
     next: &Arc<
-        dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+        dyn AsyncEngine<
+                SingleIn<PreprocessedRequest>,
+                ManyOut<Annotated<crate::backend::DecodedOutput>>,
+                Error,
+            >,
     >,
     formatter: &Arc<dyn OAIPromptFormatter>,
     tokenizer: &Arc<dyn Tokenizer>,
@@ -310,7 +314,11 @@ fn stop_downstream(slot: &PrefillContextSlot) {
 /// through the pipeline as a `max_tokens=1` request to warm the KV cache.
 async fn prefill_task(
     next: Arc<
-        dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+        dyn AsyncEngine<
+                SingleIn<PreprocessedRequest>,
+                ManyOut<Annotated<crate::backend::DecodedOutput>>,
+                Error,
+            >,
     >,
     preprocessing: PrefillPreprocessing,
     original_messages: Vec<ChatCompletionRequestMessage>,
@@ -424,8 +432,11 @@ mod tests {
 
     use super::*;
 
-    type BackendEngine =
-        dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>;
+    type BackendEngine = dyn AsyncEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<crate::backend::DecodedOutput>>,
+            Error,
+        >;
 
     struct DropProbe(Arc<AtomicBool>);
 
@@ -462,13 +473,17 @@ mod tests {
     }
 
     #[async_trait]
-    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
-        for StallingBackend
+    impl
+        AsyncEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<crate::backend::DecodedOutput>>,
+            Error,
+        > for StallingBackend
     {
         async fn generate(
             &self,
             request: SingleIn<PreprocessedRequest>,
-        ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+        ) -> Result<ManyOut<Annotated<crate::backend::DecodedOutput>>, Error> {
             self.generate_calls.fetch_add(1, Ordering::SeqCst);
             let (_request, context) = request.transfer(());
             let ctx = context.context();
@@ -513,13 +528,17 @@ mod tests {
     }
 
     #[async_trait]
-    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
-        for WindDownBackend
+    impl
+        AsyncEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<crate::backend::DecodedOutput>>,
+            Error,
+        > for WindDownBackend
     {
         async fn generate(
             &self,
             request: SingleIn<PreprocessedRequest>,
-        ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+        ) -> Result<ManyOut<Annotated<crate::backend::DecodedOutput>>, Error> {
             self.generate_calls.fetch_add(1, Ordering::SeqCst);
             let (_request, context) = request.transfer(());
             let ctx = context.context();
@@ -534,7 +553,7 @@ mod tests {
                     let _ = &probe;
                     watched.stopped().await;
                     cleanup.store(true, Ordering::SeqCst);
-                    None::<(Annotated<BackendOutput>, _)>
+                    None::<(Annotated<crate::backend::DecodedOutput>, _)>
                 });
 
             self.dispatched.notify_one();
@@ -564,13 +583,17 @@ mod tests {
     }
 
     #[async_trait]
-    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
-        for StalledInGenerateBackend
+    impl
+        AsyncEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<crate::backend::DecodedOutput>>,
+            Error,
+        > for StalledInGenerateBackend
     {
         async fn generate(
             &self,
             request: SingleIn<PreprocessedRequest>,
-        ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+        ) -> Result<ManyOut<Annotated<crate::backend::DecodedOutput>>, Error> {
             self.generate_calls.fetch_add(1, Ordering::SeqCst);
             let (_request, context) = request.transfer(());
             let ctx = context.context();

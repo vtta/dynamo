@@ -65,6 +65,21 @@ impl HasTokenIds for BackendOutput {
     }
 }
 
+impl HasTokenIds for crate::backend::DecodedOutput {
+    fn token_ids(&self) -> &[TokenIdType] {
+        &self.token_ids
+    }
+    fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
+        self.worker_trace_link.as_ref()
+    }
+    fn decoder_checkpoint(&self) -> Option<&DecoderCheckpoint> {
+        self.jailed_text.as_ref()
+    }
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
+        self.completion_usage.as_mut()
+    }
+}
+
 impl HasTokenIds for LLMEngineOutput {
     fn token_ids(&self) -> &[TokenIdType] {
         &self.token_ids
@@ -3847,7 +3862,13 @@ mod tests {
             &self,
             request: SingleIn<PreprocessedRequest>,
         ) -> Result<ManyOut<Annotated<BackendOutput>>> {
-            Operator::generate(self.backend.as_ref(), request, self.raw_engine.clone()).await
+            let stream =
+                Operator::generate(self.backend.as_ref(), request, self.raw_engine.clone()).await?;
+            let context = stream.context();
+            Ok(ResponseStream::new(
+                Box::pin(stream.map(|chunk| chunk.map_data(|output| Ok(output.into_output())))),
+                context,
+            ))
         }
     }
 

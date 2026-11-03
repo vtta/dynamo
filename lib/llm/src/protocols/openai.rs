@@ -349,6 +349,12 @@ pub(crate) fn convert_backend_top_logprobs(
     result
 }
 
+/// Parser output at stream end, before the final usage trailer.
+pub struct FinalizedOutput<Response> {
+    pub responses: Vec<Response>,
+    pub has_finish_reason: bool,
+}
+
 pub trait DeltaGeneratorExt<ResponseType: Send + 'static + std::fmt::Debug>:
     Send + 'static
 {
@@ -356,6 +362,22 @@ pub trait DeltaGeneratorExt<ResponseType: Send + 'static + std::fmt::Debug>:
         &mut self,
         response: common::llm_backend::BackendOutput,
     ) -> Result<ResponseType>;
+
+    /// Consume the frontend decoder's typed output; legacy generators need only its metadata/text.
+    fn choice_from_decoded(
+        &mut self,
+        output: crate::backend::DecodedOutput,
+    ) -> Result<ResponseType> {
+        self.choice_from_postprocessor(output.into_output())
+    }
+
+    /// Flush model-parser state at EOF before the usage trailer.
+    fn finish_decoded(&mut self) -> Result<FinalizedOutput<ResponseType>> {
+        Ok(FinalizedOutput {
+            responses: Vec::new(),
+            has_finish_reason: false,
+        })
+    }
 
     /// Gets the current prompt token count (Input Sequence Length).
     fn get_isl(&self) -> Option<u32>;

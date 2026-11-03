@@ -27,6 +27,9 @@ pub struct DecoderCheckpoint {
     jailed_text: String,
     #[serde(skip)]
     pending_token_ids: Vec<TokenIdType>,
+    // In-process retry state only; the wire representation remains the withheld text.
+    #[serde(skip)]
+    pub(crate) decoded_pieces: Option<crate::backend::decoded::DecodedPieces>,
 }
 
 impl DecoderCheckpoint {
@@ -35,6 +38,7 @@ impl DecoderCheckpoint {
         Self {
             jailed_text,
             pending_token_ids,
+            decoded_pieces: None,
         }
     }
 

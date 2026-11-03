@@ -136,7 +136,7 @@ async fn aggregate_with_partial_recovery(
     parsing_options: ParsingOptions,
 ) -> PayloadOutcome {
     let Some(error_at) = chunks.iter().position(|chunk| chunk.is_error()) else {
-        return match DeltaAggregator::apply_for_selected_unified_parser(
+        return match DeltaAggregator::apply_frontend_stream(
             futures::stream::iter(chunks),
             parsing_options,
         )
@@ -163,12 +163,10 @@ async fn aggregate_with_partial_recovery(
     if chunks.is_empty() {
         return PayloadOutcome::dropped(None, reason);
     }
-    let partial = DeltaAggregator::apply_for_selected_unified_parser(
-        futures::stream::iter(chunks),
-        parsing_options,
-    )
-    .await
-    .ok();
+    let partial =
+        DeltaAggregator::apply_frontend_stream(futures::stream::iter(chunks), parsing_options)
+            .await
+            .ok();
     PayloadOutcome::dropped(partial, reason)
 }
 

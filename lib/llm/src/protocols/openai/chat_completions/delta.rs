@@ -46,6 +46,7 @@ impl NvCreateChatCompletionRequest {
 
 /// Generates incremental chat completion responses in a streaming fashion.
 pub struct DeltaGenerator {
+    pub(crate) output_parser: Option<super::output_parser::TokenOutputParser>,
     /// State shared with the text completion delta generator.
     state: DeltaGeneratorState,
     /// Optional service tier information for the response.
@@ -62,6 +63,7 @@ pub struct DeltaGenerator {
 impl DeltaGenerator {
     pub fn new(model: String, options: DeltaGeneratorOptions, request_id: String) -> Self {
         Self {
+            output_parser: None,
             state: DeltaGeneratorState::new(
                 format!("chatcmpl-{request_id}"),
                 "chat.completion.chunk".to_string(),
@@ -374,6 +376,65 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         }
 
         Ok(stream_response)
+    }
+
+    fn choice_from_decoded(
+        &mut self,
+        decoded: crate::backend::DecodedOutput,
+    ) -> anyhow::Result<NvCreateChatCompletionStreamResponse> {
+        let Some(parser) = self.output_parser.as_mut() else {
+            return self.choice_from_postprocessor(decoded.into_output());
+        };
+        if matches!(decoded.finish_reason, Some(common::FinishReason::Error(_))) {
+            return self.choice_from_postprocessor(decoded.into_output());
+        }
+        let (mut output, parsed) = parser.parse(decoded)?;
+        output.text = None;
+        let mut response = self.choice_from_postprocessor(output)?;
+        self.output_parser
+            .as_mut()
+            .unwrap()
+            .project(parsed, &mut response);
+        Ok(response)
+    }
+
+    fn finish_decoded(
+        &mut self,
+    ) -> anyhow::Result<
+        crate::protocols::openai::FinalizedOutput<NvCreateChatCompletionStreamResponse>,
+    > {
+        let Some(parser) = self.output_parser.as_mut() else {
+            return Ok(crate::protocols::openai::FinalizedOutput {
+                responses: Vec::new(),
+                has_finish_reason: false,
+            });
+        };
+        let tails = parser.finish()?;
+        let mut output = Vec::new();
+        for parsed in tails {
+            let mut response = self.create_choice(parsed.index, None, None, None);
+            self.output_parser
+                .as_mut()
+                .unwrap()
+                .project_eof(parsed, &mut response);
+            if !response.inner.choices.is_empty() {
+                output.push(response);
+            }
+        }
+        let has_finish_reason = output.iter().any(|response| {
+            response
+                .inner
+                .choices
+                .iter()
+                .any(|choice| choice.finish_reason.is_some())
+        });
+        if has_finish_reason {
+            self.state.tracker_ref().record_finish();
+        }
+        Ok(crate::protocols::openai::FinalizedOutput {
+            responses: output,
+            has_finish_reason,
+        })
     }
 
     fn get_isl(&self) -> Option<u32> {

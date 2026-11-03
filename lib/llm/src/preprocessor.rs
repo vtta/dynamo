@@ -472,10 +472,10 @@ pub(crate) const DEFAULT_THINKING_MODE_RUNTIME_KEY: &str = "default_thinking_mod
 /// split-router query-only (`query_instance_id`) path; it is first-write-wins, so the
 /// frontend's own recordings (when present) take precedence over the forwarded values.
 fn drain_router_routing_data(
-    data: &mut Option<BackendOutput>,
+    data: Option<&mut BackendOutput>,
     tracker: Option<&crate::protocols::common::timing::RequestTracker>,
 ) {
-    let Some(routing_data) = data.as_mut().and_then(|d| d.routing_data.take()) else {
+    let Some(routing_data) = data.and_then(|d| d.routing_data.take()) else {
         return;
     };
     let Some(tracker) = tracker else {
@@ -5630,7 +5630,7 @@ impl OpenAIPreprocessor {
         mm_counts: MultimodalCounts,
     ) -> impl Stream<Item = Annotated<Resp>> + Send
     where
-        S: Stream<Item = Annotated<BackendOutput>> + Send + 'static,
+        S: Stream<Item = Annotated<crate::backend::DecodedOutput>> + Send + 'static,
         Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
     {
         Self::transform_postprocessor_stream_with_image_tokens(
@@ -5657,7 +5657,7 @@ impl OpenAIPreprocessor {
         image_tokens: Option<usize>,
     ) -> impl Stream<Item = Annotated<Resp>> + Send
     where
-        S: Stream<Item = Annotated<BackendOutput>> + Send + 'static,
+        S: Stream<Item = Annotated<crate::backend::DecodedOutput>> + Send + 'static,
         Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
     {
         struct DetokenizeMetricsGuard {
@@ -5687,7 +5687,8 @@ impl OpenAIPreprocessor {
         where
             Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
         {
-            response_stream: Pin<Box<dyn Stream<Item = Annotated<BackendOutput>> + Send>>,
+            response_stream:
+                Pin<Box<dyn Stream<Item = Annotated<crate::backend::DecodedOutput>> + Send>>,
             response_generator: Box<dyn DeltaGeneratorExt<Resp>>,
             detokenize_metrics: DetokenizeMetricsGuard,
             context: Arc<dyn AsyncEngineContext>,
@@ -5699,6 +5700,8 @@ impl OpenAIPreprocessor {
             /// chunk (ANNOTATION_PAYLOAD_USAGE). Only Some when is_usage_enabled().
             pending_client_usage: Option<Annotated<Resp>>,
             finished: bool,
+            parser_finished: bool,
+            pending_parser_output: std::collections::VecDeque<Resp>,
             emit_payload_usage_chunk: bool,
             trace_tokens_enabled: bool,
             trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
@@ -5718,6 +5721,8 @@ impl OpenAIPreprocessor {
             usage_chunk_sent: false,
             pending_client_usage: None,
             finished: false,
+            parser_finished: false,
+            pending_parser_output: std::collections::VecDeque::new(),
             emit_payload_usage_chunk,
             trace_tokens_enabled,
             trace_finish_reason_metadata,
@@ -5742,17 +5747,25 @@ impl OpenAIPreprocessor {
                     return Some((client_chunk, inner));
                 }
 
+                if let Some(chunk) = inner.pending_parser_output.pop_front() {
+                    return Some((Annotated::from_data(chunk), inner));
+                }
+
                 // If already finished (and no pending client chunk), stop.
                 if inner.finished {
                     return None;
                 }
 
-                if let Some(mut response) = inner.response_stream.next().await {
+                if let Some(mut response) = if inner.parser_finished {
+                    None
+                } else {
+                    inner.response_stream.next().await
+                } {
                     // Split topology: overlay a standalone router's forwarded routing_data
                     // (timing, query-only token_ids) onto this request's tracker so the
                     // frontend's nvext/timing surfaces populate.
                     drain_router_routing_data(
-                        &mut response.data,
+                        response.data.as_deref_mut(),
                         inner.detokenize_metrics.tracker(),
                     );
 
@@ -5798,10 +5811,11 @@ impl OpenAIPreprocessor {
 
                     let current_osl = inner.cumulative_output_tokens;
 
+                    let mut classified_error = None;
                     let mut response = response.map_data(|data| {
                         inner
                             .response_generator
-                            .choice_from_postprocessor(data)
+                            .choice_from_decoded(data)
                             .inspect_err(|e| {
                                 tracing::error!(
                                     request_id = inner.context.id(),
@@ -5811,8 +5825,14 @@ impl OpenAIPreprocessor {
                                 inner.cancelled = true;
                                 inner.context.stop_generating();
                             })
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| {
+                                classified_error = e.downcast_ref::<DynamoError>().cloned();
+                                e.to_string()
+                            })
                     });
+                    if let Some(error) = classified_error {
+                        response.error = Some(error);
+                    }
 
                     // Create LLM metrics annotation with prefill/decode worker info from tracker.
                     // Worker types are stored at routing time to avoid expensive MDC lookup.
@@ -5850,6 +5870,27 @@ impl OpenAIPreprocessor {
 
                     Some((response, inner))
                 } else {
+                    if !inner.parser_finished {
+                        inner.parser_finished = true;
+                        match inner.response_generator.finish_decoded() {
+                            Ok(finalized) => {
+                                inner.finish_reason_sent |= finalized.has_finish_reason;
+                                inner.pending_parser_output.extend(finalized.responses);
+                            }
+                            Err(error) => {
+                                inner.context.stop_generating();
+                                inner.finished = true;
+                                let mut response = Annotated::from_error(error.to_string());
+                                if let Some(classified) = error.downcast_ref::<DynamoError>() {
+                                    response.error = Some(classified.clone());
+                                }
+                                return Some((response, inner));
+                            }
+                        }
+                        if let Some(chunk) = inner.pending_parser_output.pop_front() {
+                            return Some((Annotated::from_data(chunk), inner));
+                        }
+                    }
                     // Stream has ended - must set finished to true to prevent unfold from polling
                     // again. The stream is exhausted and will panic if polled after None.
                     inner.finished = true;
@@ -7744,14 +7785,18 @@ impl
         SingleIn<NvCreateChatCompletionRequest>,
         ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
         SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<BackendOutput>>,
+        ManyOut<Annotated<crate::backend::DecodedOutput>>,
     > for OpenAIPreprocessor
 {
     async fn generate(
         &self,
         request: SingleIn<NvCreateChatCompletionRequest>,
         next: Arc<
-            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+            dyn AsyncEngine<
+                    SingleIn<PreprocessedRequest>,
+                    ManyOut<Annotated<crate::backend::DecodedOutput>>,
+                    Error,
+                >,
         >,
     ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
         // unpack the request
@@ -7804,7 +7849,7 @@ impl
         Self::normalize_kimi_k3_named_tool_choice(&mut request, self.tool_call_parser.as_deref());
 
         // create a response generator
-        let response_generator = request.response_generator(context.id().to_string());
+        let mut response_generator = request.response_generator(context.id().to_string());
         let tracker = Some(response_generator.tracker());
         let preprocess_options = PreprocessRequestOptions {
             preserve_omitted_max_tokens: context
@@ -7839,6 +7884,40 @@ impl
         )?;
         let tool_processing_route =
             self.tool_processing_route(&request, &guided_tool_constraint)?;
+        let decoded_input = matches!(&tool_processing_route,
+            ToolProcessingRoute::Unified(family) if crate::protocols::openai::chat_completions::unified_parser::uses_decoded_input(family, &guided_tool_constraint));
+        let reasoning_disabled = Self::request_disables_reasoning_with_family(
+            &request,
+            self.tool_call_parser.as_deref(),
+            self.runtime_config.reasoning_parser.as_deref(),
+            None,
+            match &tool_processing_route {
+                ToolProcessingRoute::Unified(family) => Some(*family),
+                _ => None,
+            },
+        );
+        if decoded_input {
+            if common_request.output_options.skip_special_tokens == Some(true) {
+                return Err(invalid_argument_error(
+                    "native DeepSeek output requires skip_special_tokens=false",
+                ));
+            }
+            common_request.output_control_tokens = Some(crate::protocols::openai::chat_completions::output_parser::TokenOutputParser::control_tokens(self.tokenizer.as_ref())?);
+            let tools =
+                crate::preprocessor::tool_choice::effective_tool_definitions(&request.inner)?;
+            let prefill =
+                crate::protocols::openai::chat_completions::unified_parser::stream_prefill(
+                    "deepseek_v41",
+                    prompt_injected_reasoning.unified,
+                );
+            response_generator.output_parser = Some(
+                crate::protocols::openai::chat_completions::output_parser::TokenOutputParser::new(
+                    &tools,
+                    prefill,
+                    Self::has_structured_response_format(&request),
+                ),
+            );
+        }
         let payload_parsing_options = payload_handle.as_ref().map(|_| {
             context
                 .get_optional::<ParsingOptions>(REQUEST_PARSING_OPTIONS_CONTEXT_KEY)
@@ -7924,13 +8003,28 @@ impl
             image_tokens,
         );
 
-        let transformed_stream = self.postprocessor_parsing_stream_with_constraint(
-            stream,
-            &request,
-            prompt_injected_reasoning,
-            guided_tool_constraint,
-            tool_processing_route,
-        )?;
+        let transformed_stream: Pin<
+            Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
+        > = if decoded_input {
+            Box::pin(Self::apply_unified_response_policies(
+                Box::pin(
+                    crate::protocols::openai::chat_completions::output_parser::fanout_choices(
+                        stream,
+                    ),
+                ),
+                Self::tool_call_parsing_enabled(&request),
+                Self::wants_reasoning_as_content_when_empty(request.chat_template_args.as_ref()),
+                reasoning_disabled,
+            ))
+        } else {
+            Box::pin(self.postprocessor_parsing_stream_with_constraint(
+                stream,
+                &request,
+                prompt_injected_reasoning,
+                guided_tool_constraint,
+                tool_processing_route,
+            )?)
+        };
         let transformed_stream = Self::normalize_chat_stream_roles(transformed_stream);
 
         // Request payload capture is a pass-through: every chunk reaches the HTTP
@@ -7993,14 +8087,18 @@ impl
         SingleIn<NvCreateCompletionRequest>,
         ManyOut<Annotated<NvCreateCompletionResponse>>,
         SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<BackendOutput>>,
+        ManyOut<Annotated<crate::backend::DecodedOutput>>,
     > for OpenAIPreprocessor
 {
     async fn generate(
         &self,
         request: SingleIn<NvCreateCompletionRequest>,
         next: Arc<
-            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+            dyn AsyncEngine<
+                    SingleIn<PreprocessedRequest>,
+                    ManyOut<Annotated<crate::backend::DecodedOutput>>,
+                    Error,
+                >,
         >,
     ) -> Result<ManyOut<Annotated<NvCreateCompletionResponse>>, Error> {
         let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
@@ -13635,13 +13733,17 @@ mod tests {
     struct UnreachableBackend;
 
     #[async_trait]
-    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
-        for UnreachableBackend
+    impl
+        AsyncEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<crate::backend::DecodedOutput>>,
+            Error,
+        > for UnreachableBackend
     {
         async fn generate(
             &self,
             _request: SingleIn<PreprocessedRequest>,
-        ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+        ) -> Result<ManyOut<Annotated<crate::backend::DecodedOutput>>, Error> {
             panic!("request must be rejected before backend dispatch")
         }
     }
@@ -13674,7 +13776,11 @@ mod tests {
             unsupported_fields: Default::default(),
         };
         let next: Arc<
-            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+            dyn AsyncEngine<
+                    SingleIn<PreprocessedRequest>,
+                    ManyOut<Annotated<crate::backend::DecodedOutput>>,
+                    Error,
+                >,
         > = Arc::new(UnreachableBackend);
 
         let result =
@@ -13703,7 +13809,11 @@ mod tests {
         }))
         .unwrap();
         let next: Arc<
-            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+            dyn AsyncEngine<
+                    SingleIn<PreprocessedRequest>,
+                    ManyOut<Annotated<crate::backend::DecodedOutput>>,
+                    Error,
+                >,
         > = Arc::new(UnreachableBackend);
 
         let result =
@@ -13744,7 +13854,11 @@ mod tests {
         }))
         .unwrap();
         let next: Arc<
-            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+            dyn AsyncEngine<
+                    SingleIn<PreprocessedRequest>,
+                    ManyOut<Annotated<crate::backend::DecodedOutput>>,
+                    Error,
+                >,
         > = Arc::new(UnreachableBackend);
 
         let result =
@@ -13764,13 +13878,17 @@ mod tests {
     struct PromptRecordingBackend(std::sync::Mutex<Vec<usize>>);
 
     #[async_trait]
-    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
-        for PromptRecordingBackend
+    impl
+        AsyncEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<crate::backend::DecodedOutput>>,
+            Error,
+        > for PromptRecordingBackend
     {
         async fn generate(
             &self,
             request: SingleIn<PreprocessedRequest>,
-        ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+        ) -> Result<ManyOut<Annotated<crate::backend::DecodedOutput>>, Error> {
             self.0.lock().unwrap().push(request.token_ids.len());
             anyhow::bail!("stop before any output")
         }
