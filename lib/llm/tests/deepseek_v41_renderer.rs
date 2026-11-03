@@ -107,3 +107,41 @@ fn cached_images_render_in_user_and_tool_messages() {
         assert!(!output.contains("cached-screenshot"));
     }
 }
+
+#[test]
+fn anthropic_effort_reaches_the_native_renderer() {
+    use dynamo_llm::protocols::anthropic::AnthropicCreateMessageRequest;
+    for (effort, budget) in [
+        (json!(1), 1),
+        (json!(25), 25),
+        (json!(75), 75),
+        (json!(100), 100),
+        (json!("low"), 50),
+        (json!("high"), 75),
+        (json!("max"), 100),
+    ] {
+        let request: AnthropicCreateMessageRequest = serde_json::from_value(json!({
+            "model":"test", "max_tokens":16, "thinking":{"type":"adaptive"},
+            "output_config":{"effort":effort},
+            "messages":[{"role":"user","content":"Hello"}]
+        }))
+        .unwrap();
+        let request = NvCreateChatCompletionRequest::try_from(request).unwrap();
+        let prompt = DeepSeekV41Formatter.render(&request).unwrap();
+        assert!(prompt.contains(&format!("Reasoning Effort: {budget} ")));
+    }
+}
+
+#[test]
+fn anthropic_numeric_effort_does_not_override_disabled_thinking() {
+    use dynamo_llm::protocols::anthropic::AnthropicCreateMessageRequest;
+    let request: AnthropicCreateMessageRequest = serde_json::from_value(json!({
+        "model":"test", "max_tokens":16, "thinking":{"type":"disabled"},
+        "output_config":{"effort":100}, "messages":[{"role":"user","content":"Hello"}]
+    }))
+    .unwrap();
+    let request = NvCreateChatCompletionRequest::try_from(request).unwrap();
+    let prompt = DeepSeekV41Formatter.render(&request).unwrap();
+    assert!(!prompt.contains("Reasoning Effort:"));
+    assert!(prompt.ends_with("</think>"));
+}

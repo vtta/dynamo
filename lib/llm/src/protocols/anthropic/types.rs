@@ -143,6 +143,38 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
             .filter(|sequences| !sequences.is_empty())
             .map(dynamo_protocols::types::Stop::StringArray);
 
+        // Anthropic owns the public field; the model formatter owns its effect.
+        let mut chat_template_args = req.thinking.as_ref().and_then(|thinking| {
+            let enabled = match thinking.thinking_type.as_str() {
+                "enabled" => true,
+                "disabled" => false,
+                _ => return None,
+            };
+            Some(std::collections::HashMap::from([(
+                "enable_thinking".to_string(),
+                serde_json::Value::Bool(enabled),
+            )]))
+        });
+        let mut reasoning_effort = None;
+        if let Some(config) = req.output_config.as_ref().filter(|value| !value.is_null()) {
+            anyhow::ensure!(config.is_object(), "output_config must be an object");
+            if let Some(effort) = config.get("effort").filter(|value| !value.is_null()) {
+                if matches!(effort.as_str(), Some("low" | "medium" | "high" | "max")) {
+                    reasoning_effort = Some(serde_json::from_value(effort.clone())?);
+                } else {
+                    anyhow::ensure!(
+                        effort
+                            .as_u64()
+                            .is_some_and(|value| (1..=100).contains(&value)),
+                        "output_config.effort must be low, medium, high, max, or an integer within 1–100"
+                    );
+                    chat_template_args
+                        .get_or_insert_with(Default::default)
+                        .insert("reasoning_effort".to_string(), effort.clone());
+                }
+            }
+        }
+
         let response_format = req
             .output_config
             .as_mut()
@@ -170,7 +202,7 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
             })
             .transpose()?;
 
-        Ok(NvCreateChatCompletionRequest {
+        let mut converted = NvCreateChatCompletionRequest {
             inner: dynamo_protocols::types::CreateChatCompletionRequest {
                 messages,
                 model: req.model,
@@ -182,6 +214,7 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
                 tool_choice,
                 parallel_tool_calls,
                 response_format,
+                reasoning_effort,
                 stream: Some(true), // Always stream internally
                 // Request cumulative usage on every chunk (not just the final
                 // one) so the Anthropic stream converter can stamp an
@@ -200,30 +233,15 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
                 ..Default::default()
             },
             nvext: crate::protocols::common::extensions::parse_nvext(req.nvext)?,
-            // chat_template_args may be augmented by the Anthropic handler
-            // (anthropic.rs) after conversion — e.g., setting enable_thinking=true
-            // when a reasoning parser is configured. The conversion layer only
-            // forwards the client's explicit thinking preference here; the handler
-            // has access to parsing_options and makes the final decision.
-            chat_template_args: req.thinking.as_ref().and_then(|thinking| {
-                let enabled = match thinking.thinking_type.as_str() {
-                    "enabled" => true,
-                    "disabled" => false,
-                    _ => return None,
-                };
-                let mut args = std::collections::HashMap::new();
-                args.insert(
-                    "enable_thinking".to_string(),
-                    serde_json::Value::Bool(enabled),
-                );
-                Some(args)
-            }),
+            chat_template_args,
             thinking: None,
             thinking_token_budget: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
             unsupported_fields: Default::default(),
-        })
+        };
+        converted.normalize_reasoning_template_args()?;
+        Ok(converted)
     }
 }
 
@@ -3055,6 +3073,90 @@ mod thinking_control_tests {
             request["thinking"] = thinking;
         }
         serde_json::from_value(request).unwrap()
+    }
+
+    #[test]
+    fn numeric_effort_preserves_value_and_disabled_thinking() {
+        for effort in [1, 25, 75, 100] {
+            let mut request = request_with_thinking(Some(serde_json::json!({"type":"disabled"})));
+            request.output_config = Some(serde_json::json!({"effort":effort}));
+            let converted = NvCreateChatCompletionRequest::try_from(request).unwrap();
+            let args = converted.chat_template_args.unwrap();
+            assert_eq!(args["reasoning_effort"], effort);
+            assert_eq!(args["enable_thinking"], false);
+            assert!(converted.inner.reasoning_effort.is_none());
+        }
+    }
+
+    #[test]
+    fn named_effort_uses_the_canonical_chat_field() {
+        for effort in ["low", "medium", "high", "max"] {
+            let mut request = request_with_thinking(None);
+            request.output_config = Some(serde_json::json!({"effort":effort}));
+            let converted = NvCreateChatCompletionRequest::try_from(request).unwrap();
+            assert_eq!(
+                serde_json::to_value(converted.inner.reasoning_effort).unwrap(),
+                effort
+            );
+            assert_eq!(
+                converted.chat_template_args.unwrap()["reasoning_effort"],
+                effort
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_null_effort_keeps_model_default() {
+        for config in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"effort":null})),
+        ] {
+            let mut request = request_with_thinking(None);
+            request.output_config = config;
+            let converted = NvCreateChatCompletionRequest::try_from(request).unwrap();
+            assert!(converted.inner.reasoning_effort.is_none());
+            assert!(converted.chat_template_args.is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_effort_is_rejected_before_generation() {
+        for effort in [
+            serde_json::json!(0),
+            serde_json::json!(101),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!("100"),
+            serde_json::json!("unknown"),
+        ] {
+            let mut request = request_with_thinking(None);
+            request.output_config = Some(serde_json::json!({"effort":effort}));
+            assert!(
+                NvCreateChatCompletionRequest::try_from(request).is_err(),
+                "{effort}"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_and_json_schema_both_survive_conversion() {
+        let mut request = request_with_thinking(None);
+        request.output_config = Some(serde_json::json!({"effort":100,
+            "format":{"type":"json_schema", "schema":{"type":"object"}}}));
+        let converted = NvCreateChatCompletionRequest::try_from(request).unwrap();
+        assert_eq!(
+            converted.chat_template_args.unwrap()["reasoning_effort"],
+            100
+        );
+        assert!(matches!(
+            converted.inner.response_format,
+            Some(ResponseFormat::JsonSchema { .. })
+        ));
     }
 
     #[test]

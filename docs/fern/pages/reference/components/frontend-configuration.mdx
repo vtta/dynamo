@@ -847,6 +847,21 @@ for a reference-image-plus-prompt example.
 | `POST` | `/v1/messages` | Anthropic Messages API (requires `--enable-anthropic-api`) |
 | `POST` | `/v1/messages/count_tokens` | Token counting for the Anthropic API |
 
+On `/v1/messages`, `output_config.effort` is forwarded per request to the selected model formatter.
+Named values are `low`, `medium`, `high`, and `max`; support for each name depends
+on the model. Native DeepSeek V4.1 also accepts integer values from 1 through 100
+as a Dynamo extension. For example, `"output_config": {"effort": 100}` selects
+maximum effort without changing the default for other requests. Omitted or null
+effort keeps the model default. Invalid types and out-of-range numbers return
+HTTP 400. `thinking: {"type": "disabled"}` still disables thinking independently.
+The OpenAI `chat_template_kwargs` field is not an Anthropic effort override.
+
+On the native DeepSeek V4.1 token path, reasoning boundaries use original backend
+token IDs. Literal marker spellings inside ordinary text or tool arguments remain
+data. This path requires preserved special tokens and rejects
+`skip_special_tokens=true`; text-only backend processors retain their existing
+parser behavior.
+
 ### Infrastructure
 
 | Method | Path | Description |
